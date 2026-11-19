@@ -5,8 +5,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
-#include "config/config.h"
-#include "ext/context.h"
+#include <morph/ext.h>
 
 #include <nb/err.h>
 
@@ -37,55 +36,45 @@ static const char *env_value(const char *name)
 	return value ? value : "";
 }
 
-static void copy_field(char *dest, size_t capacity, const char *value)
+static const char *harness_get_config_string(void *host_data, const char *path)
 {
-	size_t length;
-
-	if (!value)
-		value = "";
-	length = strlen(value);
-	if (length >= capacity)
-		length = capacity - 1;
-	memcpy(dest, value, length);
-	dest[length] = '\0';
+	(void)host_data;
+	static const struct {
+		const char *path;
+		const char *environment;
+	} fields[] = {
+		{"model.text.adapter", "HARNESS_TEXT_ADAPTER"},
+		{"model.text.provider", "HARNESS_TEXT_PROVIDER"},
+		{"model.text.api_key", "HARNESS_TEXT_API_KEY"},
+		{"model.text.api_key_env", "HARNESS_TEXT_API_KEY_ENV"},
+		{"model.vision.api_key", "HARNESS_VISION_API_KEY"},
+		{"model.vision.api_key_env", "HARNESS_VISION_API_KEY_ENV"},
+	};
+	for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+		if (strcmp(path, fields[i].path) == 0)
+			return env_value(fields[i].environment);
+	}
+	return NULL;
 }
 
 int harness_run(const char *args_json, char **result_json)
 {
-	static struct config config;
-	static struct ext_host_api host;
+	struct ext_host_api host = {0};
 	struct ext_context context = {0};
-
-	memset(&config, 0, sizeof(config));
-	memset(&host, 0, sizeof(host));
-
-	copy_field(config.models.text.adapter,
-		   sizeof(config.models.text.adapter),
-		   env_value("HARNESS_TEXT_ADAPTER"));
-	copy_field(config.models.text.provider,
-		   sizeof(config.models.text.provider),
-		   env_value("HARNESS_TEXT_PROVIDER"));
-	copy_field(config.models.text.api_key,
-		   sizeof(config.models.text.api_key),
-		   env_value("HARNESS_TEXT_API_KEY"));
-	copy_field(config.models.text.api_key_env,
-		   sizeof(config.models.text.api_key_env),
-		   env_value("HARNESS_TEXT_API_KEY_ENV"));
-	copy_field(config.models.vision.api_key,
-		   sizeof(config.models.vision.api_key),
-		   env_value("HARNESS_VISION_API_KEY"));
-	copy_field(config.models.vision.api_key_env,
-		   sizeof(config.models.vision.api_key_env),
-		   env_value("HARNESS_VISION_API_KEY_ENV"));
 
 	host.abi_version = EXT_CONTEXT_ABI_VERSION;
 	host.struct_size = sizeof(host);
 	host.check_cancelled = harness_check_cancelled;
 	host.log = harness_log;
+	host.get_config_string = harness_get_config_string;
+	const char *mode = env_value("HARNESS_HOST_MODE");
+	if (strcmp(mode, "old-host") == 0)
+		host.struct_size = offsetof(struct ext_host_api, get_config_string);
+	if (strcmp(mode, "missing-callback") == 0)
+		host.get_config_string = NULL;
 
 	context.abi_version = EXT_CONTEXT_ABI_VERSION;
 	context.struct_size = sizeof(context);
-	context.config = &config;
 	context.host = &host;
 
 	return ext_run_v2(&context, args_json, result_json);

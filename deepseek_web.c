@@ -1,8 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
-#include "config/config.h"
 #include "cJSON.h"
-#include "ext/context.h"
+#include <morph/ext.h>
 
 #include <curl/curl.h>
 #include <nb/buf.h>
@@ -24,8 +23,9 @@
  *     int ext_run_v2(const struct ext_context *context,
  *                    const char *args_json, char **result_json);
  *
- * The host passes a read-only snapshot of the effective configuration, so the
- * tool no longer probes config files or the host process's argv.  The API key
+ * The host exposes the effective configuration through get_config_string, so
+ * the tool never depends on private config layouts or probes config files.
+ * The API key
  * and the selected adapter come from [model.text], with [model.vision] as a
  * key-only fallback; DEEPSEEK_API_KEY remains the last resort.
  *
@@ -88,11 +88,17 @@ static int json_bool(cJSON *root, const char *name, int fallback)
  * "deepseek" means the DeepSeek adapter.  Any other explicit adapter is refused
  * before an HTTP request is made.
  */
-static int deepseek_adapter_supported(const struct config_model_entry *text,
+static int deepseek_adapter_supported(const struct ext_context *context,
 				      char **error)
 {
-	const char *adapter = text->adapter[0] ? text->adapter : NULL;
-	const char *provider = text->provider[0] ? text->provider : NULL;
+	const char *adapter = context->host->get_config_string(
+		context->host_data, "model.text.adapter");
+	const char *provider = context->host->get_config_string(
+		context->host_data, "model.text.provider");
+	if (adapter && !*adapter)
+		adapter = NULL;
+	if (provider && !*provider)
+		provider = NULL;
 	int supported = adapter ? strcmp(adapter, "deepseek") == 0
 				: provider ? strcmp(provider, "deepseek") == 0
 					   : 0;
@@ -128,9 +134,9 @@ static int deepseek_adapter_supported(const struct config_model_entry *text,
 
 static char *key_from_entry(const char *api_key, const char *api_key_env)
 {
-	if (api_key[0])
+	if (api_key && api_key[0])
 		return strdup(api_key);
-	if (api_key_env[0]) {
+	if (api_key_env && api_key_env[0]) {
 		const char *value = getenv(api_key_env);
 
 		if (value && *value)
@@ -139,14 +145,16 @@ static char *key_from_entry(const char *api_key, const char *api_key_env)
 	return NULL;
 }
 
-static char *resolve_api_key(const struct config *config, char **error)
+static char *resolve_api_key(const struct ext_context *context, char **error)
 {
-	char *key = key_from_entry(config->models.text.api_key,
-				   config->models.text.api_key_env);
+	char *key = key_from_entry(
+		context->host->get_config_string(context->host_data, "model.text.api_key"),
+		context->host->get_config_string(context->host_data, "model.text.api_key_env"));
 
 	if (!key)
-		key = key_from_entry(config->models.vision.api_key,
-				     config->models.vision.api_key_env);
+		key = key_from_entry(
+			context->host->get_config_string(context->host_data, "model.vision.api_key"),
+			context->host->get_config_string(context->host_data, "model.vision.api_key_env"));
 	if (!key) {
 		const char *value = getenv("DEEPSEEK_API_KEY");
 
@@ -451,12 +459,19 @@ int ext_run_v2(const struct ext_context *context, const char *args_json,
 	if (*result_json)
 		return NB_ERR_EXISTS;
 	if (!context || context->abi_version != EXT_CONTEXT_ABI_VERSION ||
-	    context->struct_size < sizeof(*context) || !context->config ||
+	    context->struct_size < sizeof(*context) ||
 	    !context->host ||
 	    context->host->abi_version != EXT_CONTEXT_ABI_VERSION ||
-	    context->host->struct_size < sizeof(*context->host) ||
+	    context->host->struct_size < offsetof(struct ext_host_api, check_cancelled) +
+					 sizeof(context->host->check_cancelled) ||
 	    !context->host->check_cancelled)
 		return NB_ERR_INVAL;
+
+	if (!EXT_HOST_HAS_CALLBACK(context->host, get_config_string)) {
+		*result_json = error_json("deepseek_web requires Morph ext SDK 1.1 "
+			"get_config_string support; upgrade the Morph host");
+		return *result_json ? NB_ERR_UNSUPPORTED : NB_ERR_NOMEM;
+	}
 
 	rc = context->host->check_cancelled(context->host_data);
 	if (rc != NB_OK)
@@ -489,13 +504,13 @@ int ext_run_v2(const struct ext_context *context, const char *args_json,
 				    "search requires a non-empty query");
 	}
 
-	if (!deepseek_adapter_supported(&context->config->models.text,
+	if (!deepseek_adapter_supported(context,
 					&resources.key_error))
 		return finish_error(&resources, result_json,
 				    resources.key_error);
 
 	resources.api_key =
-		resolve_api_key(context->config, &resources.key_error);
+		resolve_api_key(context, &resources.key_error);
 	if (!resources.api_key)
 		return finish_error(&resources, result_json,
 				    resources.key_error

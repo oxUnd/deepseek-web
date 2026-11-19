@@ -7,9 +7,9 @@ NBASE_ARCHIVE ?= $(NBASE_DEPS)/nothing-$(NBASE_VERSION).tar.gz
 NBASE_DIR ?= $(NBASE_DEPS)/nothing-$(NBASE_VERSION)
 NBASE_BUILD ?= $(NBASE_DIR)/build
 NBASE_LIB ?= $(NBASE_BUILD)/libnbase.a
-MORPH_SRC ?= ../morph
-MORPH_INC ?= $(MORPH_SRC)/src
-CPPFLAGS += -I. -I$(MORPH_INC) -I$(NBASE_DIR)/include
+MORPH_SDK ?= sdk/include
+EXT_INSTALL_DIR ?= $(HOME)/.morph/exts/deepseek_web
+CPPFLAGS += -I. -I$(MORPH_SDK) -I$(NBASE_DIR)/include
 LDLIBS ?= $(NBASE_LIB) -lpthread -lcurl
 
 all: $(NBASE_LIB) deepseek_web.so
@@ -17,13 +17,13 @@ all: $(NBASE_LIB) deepseek_web.so
 deepseek_web.so: deepseek_web.o cJSON.o $(NBASE_LIB)
 	$(CC) -shared -o $@ deepseek_web.o cJSON.o $(LDLIBS)
 
-deepseek_web.o: deepseek_web.c cJSON.h $(NBASE_LIB) | check-morph
+deepseek_web.o: deepseek_web.c cJSON.h $(MORPH_SDK)/morph/ext.h $(MORPH_SDK)/morph/ext_types.h $(NBASE_LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 cJSON.o: cJSON.c cJSON.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-test_harness.o: test_harness.c $(NBASE_LIB) | check-morph
+test_harness.o: test_harness.c $(MORPH_SDK)/morph/ext.h $(MORPH_SDK)/morph/ext_types.h $(NBASE_LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 deepseek_test.so: deepseek_web.o test_harness.o cJSON.o $(NBASE_LIB)
@@ -31,14 +31,6 @@ deepseek_test.so: deepseek_web.o test_harness.o cJSON.o $(NBASE_LIB)
 
 test: deepseek_test.so
 	python3 test_deepseek_web.py --lib ./deepseek_test.so
-
-check-morph:
-	@test -f "$(MORPH_INC)/ext/context.h" || { \
-		echo "error: Morph headers not found at $(MORPH_INC)/ext/context.h" >&2; \
-		echo "       Point MORPH_SRC at a Morph checkout with ext_run_v2:" >&2; \
-		echo "       make MORPH_SRC=/path/to/morph" >&2; \
-		exit 1; \
-	}
 
 $(NBASE_ARCHIVE):
 	@mkdir -p $(dir $@)
@@ -60,10 +52,14 @@ $(NBASE_LIB): $(NBASE_DIR)/CMakeLists.txt
 		-DNB_BUILD_FUZZERS=OFF
 	cmake --build $(NBASE_BUILD) --target nbase --parallel
 
+install: deepseek_web.so
+	mkdir -p "$(EXT_INSTALL_DIR)"
+	cp manifest.toml deepseek_web.so "$(EXT_INSTALL_DIR)/"
+
 clean:
 	rm -f deepseek_web.o test_harness.o cJSON.o deepseek_web.so deepseek_test.so
 
 distclean: clean
 	rm -rf $(NBASE_DEPS)
 
-.PHONY: all clean distclean test check-morph
+.PHONY: all install clean distclean test

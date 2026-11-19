@@ -16,6 +16,7 @@ HARNESS_ENV = (
     "HARNESS_TEXT_API_KEY_ENV",
     "HARNESS_VISION_API_KEY",
     "HARNESS_VISION_API_KEY_ENV",
+    "HARNESS_HOST_MODE",
 )
 CLEARED_ENV = HARNESS_ENV + (
     "DEEPSEEK_API_KEY",
@@ -191,6 +192,13 @@ def main():
         check(json.loads(MockHandler.seen.get("body", "{}")).get("count") == 3,
               f"{name}: wrong count")
         check("Mock result" in text, f"{name}: missing result")
+
+    for mode in ("old-host", "missing-callback"):
+        rc, text = call(lib, args, {"HARNESS_HOST_MODE": mode})
+        print(f"[{mode}] rc={rc} response={text[:160]}")
+        check(rc < 0 and "get_config_string support" in text,
+              f"{mode}: expected an explicit host compatibility error")
+        check(MockHandler.seen == {}, f"{mode}: must not make an HTTP request")
 
     rc, text = call(
         lib,
