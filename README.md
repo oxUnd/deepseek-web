@@ -58,17 +58,40 @@ Morph 原生扩展（`type = "so"`），把 DeepSeek 的
 ### 依赖
 
 - C 编译器与 `make`
+- nbase（Morph 依赖的基础库，默认 `~/Work/c-family/nothing`）
+  - 头文件：`include/nb`
+  - 静态库：`build/libnbase.a`
 - libcurl（macOS 使用系统 SDK；Linux 需要 libcurl 开发包）
 - Morph 0.5.0（当前验证版本）
 
 ### 构建
 
 ```bash
-cd deepseek-web
+# 1. 构建 nbase（如果还没有 build/libnbase.a）
+cd ~/Work/c-family/nothing
+cmake -S . -B build
+cmake --build build
+
+# 2. 构建扩展
+cd /path/to/deepseek-web
 make
 ```
 
-生成的产物是 `deepseek_web.so`。`cJSON` 已随扩展目录提供，不需要额外安装。
+生成的产物是 `deepseek_web.so`。nbase 以静态库方式链入扩展，所以安装后
+不需要额外的 nbase dylib。nbase 不在默认路径时：
+
+```bash
+make NBASE_DIR=/path/to/nothing
+```
+
+`cJSON` 已随扩展目录提供，不需要额外安装；libcurl 使用系统库。
+
+### 为什么用 nbase，但仍保留 cJSON/libcurl
+
+- 缓冲区、字符串、路径展开和 TOML 解析直接使用 nbase 的
+  `nb_buf` / `nb_str` / `nb_path_expand` / `nb_toml`，不再手写这些基础函数。
+- nbase 目前没有 JSON API，所以工具参数、请求体和错误 JSON 继续使用 cJSON。
+- nbase 目前没有 HTTP 客户端，所以请求继续使用 libcurl。
 
 ### 安装
 

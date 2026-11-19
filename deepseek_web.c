@@ -3,20 +3,21 @@
 #include "cJSON.h"
 
 #include <curl/curl.h>
-#include <ctype.h>
-#include <pwd.h>
+#include <nb/buf.h>
+#include <nb/file.h>
+#include <nb/str.h>
+#include <nb/toml.h>
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #ifdef __APPLE__
 #include <crt_externs.h>
 #endif
 
 #define DEFAULT_API_BASE "https://api.deepseek.com"
-#define MAX_CONFIG_BYTES (1024u * 1024u)
 #define MAX_RESPONSE_BYTES (8u * 1024u * 1024u)
 
 /*
@@ -29,13 +30,11 @@
  * host process's -c/--config argument, then ~/.morph/config.toml.  The key is
  * taken from [model.text] first (api_key, then api_key_env), then
  * [model.vision], then DEEPSEEK_API_KEY as a last resort.
+ *
+ * Generic containers, strings, paths and TOML parsing come from nbase.  cJSON
+ * remains because nbase has no JSON parser; libcurl remains because nbase has
+ * no HTTP client.
  */
-
-struct strbuf {
-	char *data;
-	size_t len;
-	size_t cap;
-};
 
 struct model_keys {
 	char *api_key;
@@ -44,366 +43,124 @@ struct model_keys {
 	char *provider;
 };
 
-struct http_buffer {
-	struct strbuf body;
-	int oom;
-};
-
-static int sb_reserve(struct strbuf *b, size_t need)
+static void set_error(char **error, const char *message)
 {
-	size_t cap;
-
-	if (need <= b->cap)
-		return 1;
-	cap = b->cap ? b->cap : 256;
-	while (cap < need) {
-		size_t next = cap * 2;
-		if (next <= cap) {
-			cap = need;
-			break;
-		}
-		cap = next;
+	if (error && !*error) {
+		const char *text = message ? message : "unknown error";
+		*error = strdup(text);
 	}
-	char *p = realloc(b->data, cap);
-	if (!p)
-		return 0;
-	b->data = p;
-	b->cap = cap;
-	return 1;
 }
 
-static int sb_append(struct strbuf *b, const char *data, size_t len)
+static char *dup_nb_str(nb_str value)
 {
-	if (len > SIZE_MAX - b->len - 1)
-		return 0;
-	if (!sb_reserve(b, b->len + len + 1))
-		return 0;
-	memcpy(b->data + b->len, data, len);
-	b->len += len;
-	b->data[b->len] = '\0';
-	return 1;
-}
+	char *out;
 
-static int sb_append_cstr(struct strbuf *b, const char *s)
-{
-	return sb_append(b, s, strlen(s));
-}
-
-static int sb_append_char(struct strbuf *b, char c)
-{
-	return sb_append(b, &c, 1);
-}
-
-static void sb_free(struct strbuf *b)
-{
-	free(b->data);
-	b->data = NULL;
-	b->len = 0;
-	b->cap = 0;
-}
-
-static char *read_text_file(const char *path)
-{
-	FILE *f = fopen(path, "rb");
-	struct strbuf b = {0};
-	char chunk[8192];
-	size_t n;
-	int ok = 1;
-
-	if (!f)
+	if (!value.ptr)
 		return NULL;
-	while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) {
-		if (n > MAX_CONFIG_BYTES - b.len || !sb_append(&b, chunk, n)) {
-			ok = 0;
-			break;
-		}
-	}
-	if (ferror(f))
-		ok = 0;
-	fclose(f);
-	if (!ok) {
-		sb_free(&b);
-		return NULL;
-	}
-	if (!b.data) {
-		b.data = calloc(1, 1);
-		if (!b.data)
-			return NULL;
-	}
-	return b.data;
-}
-
-static char *trim(char *s)
-{
-	char *end;
-
-	while (*s && isspace((unsigned char)*s))
-		s++;
-	end = s + strlen(s);
-	while (end > s && isspace((unsigned char)end[-1]))
-		*--end = '\0';
-	return s;
-}
-
-static void strip_comment(char *s)
-{
-	int quote = 0;
-
-	for (char *p = s; *p; p++) {
-		if (quote) {
-			if (quote == '"' && *p == '\\' && p[1]) {
-				p++;
-				continue;
-			}
-			if (*p == quote)
-				quote = 0;
-		} else if (*p == '"' || *p == '\'') {
-			quote = *p;
-		} else if (*p == '#') {
-			*p = '\0';
-			return;
-		}
-	}
-}
-
-static int append_utf8(struct strbuf *b, unsigned int cp)
-{
-	char out[4];
-	size_t n;
-
-	if (cp <= 0x7f) {
-		out[0] = (char)cp;
-		n = 1;
-	} else if (cp <= 0x7ff) {
-		out[0] = (char)(0xc0 | (cp >> 6));
-		out[1] = (char)(0x80 | (cp & 0x3f));
-		n = 2;
-	} else if (cp <= 0xffff) {
-		out[0] = (char)(0xe0 | (cp >> 12));
-		out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
-		out[2] = (char)(0x80 | (cp & 0x3f));
-		n = 3;
-	} else {
-		out[0] = (char)(0xf0 | (cp >> 18));
-		out[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
-		out[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
-		out[3] = (char)(0x80 | (cp & 0x3f));
-		n = 4;
-	}
-	return sb_append(b, out, n);
-}
-
-static int hex_value(char c)
-{
-	if (c >= '0' && c <= '9')
-		return c - '0';
-	if (c >= 'a' && c <= 'f')
-		return c - 'a' + 10;
-	if (c >= 'A' && c <= 'F')
-		return c - 'A' + 10;
-	return -1;
-}
-
-/* Parse a TOML basic or literal string.  Returns a heap string or NULL. */
-static char *parse_toml_string(const char *v)
-{
-	struct strbuf b = {0};
-
-	while (*v && isspace((unsigned char)*v))
-		v++;
-	if (*v == '"') {
-		v++;
-		while (*v && *v != '"') {
-			if (*v == '\\') {
-				v++;
-				if (!*v)
-					break;
-				switch (*v) {
-				case 'n':
-					sb_append_char(&b, '\n');
-					break;
-				case 't':
-					sb_append_char(&b, '\t');
-					break;
-				case 'r':
-					sb_append_char(&b, '\r');
-					break;
-				case 'b':
-					sb_append_char(&b, '\b');
-					break;
-				case 'f':
-					sb_append_char(&b, '\f');
-					break;
-				case '\\':
-					sb_append_char(&b, '\\');
-					break;
-				case '"':
-					sb_append_char(&b, '"');
-					break;
-				case '/':
-					sb_append_char(&b, '/');
-					break;
-				case 'u': {
-					unsigned int cp = 0;
-					for (int i = 0; i < 4; i++) {
-						int digit;
-						v++;
-						digit = hex_value(*v);
-						if (digit < 0) {
-							sb_free(&b);
-							return NULL;
-						}
-						cp = cp * 16 + (unsigned int)digit;
-					}
-					append_utf8(&b, cp);
-					break;
-				}
-				default:
-					sb_append_char(&b, *v);
-					break;
-				}
-				v++;
-			} else {
-				sb_append_char(&b, *v++);
-			}
-		}
-		if (*v != '"') {
-			sb_free(&b);
-			return NULL;
-		}
-		if (!b.data) {
-			b.data = calloc(1, 1);
-			if (!b.data)
-				return NULL;
-		}
-		return b.data;
-	}
-	if (*v == '\'') {
-		const char *start;
-		size_t len;
-		char *out;
-
-		v++;
-		start = v;
-		while (*v && *v != '\'')
-			v++;
-		if (*v != '\'')
-			return NULL;
-		len = (size_t)(v - start);
-		out = malloc(len + 1);
-		if (!out)
-			return NULL;
-		memcpy(out, start, len);
-		out[len] = '\0';
-		return out;
-	}
-	return NULL;
-}
-
-static void parse_config(const char *text, struct model_keys *text_keys,
-			 struct model_keys *vision_keys)
-{
-	char *copy = strdup(text);
-	char section[128] = {0};
-	char *save = NULL;
-
-	if (!copy)
-		return;
-	for (char *line = strtok_r(copy, "\n", &save); line;
-	     line = strtok_r(NULL, "\n", &save)) {
-		char *s = trim(line);
-		char *eq;
-		char *key;
-		char *value;
-		struct model_keys *target;
-
-		strip_comment(s);
-		s = trim(s);
-		if (*s == '[') {
-			char *end = strchr(s, ']');
-			if (end) {
-				*end = '\0';
-				snprintf(section, sizeof(section), "%s", trim(s + 1));
-			}
-			continue;
-		}
-		if (!*s)
-			continue;
-		if (strcmp(section, "model.text") == 0)
-			target = text_keys;
-		else if (strcmp(section, "model.vision") == 0)
-			target = vision_keys;
-		else
-			continue;
-		eq = strchr(s, '=');
-		if (!eq)
-			continue;
-		*eq = '\0';
-		key = trim(s);
-		value = trim(eq + 1);
-		if (strcmp(key, "api_key") == 0) {
-			char *parsed = parse_toml_string(value);
-			if (parsed) {
-				free(target->api_key);
-				target->api_key = parsed;
-			}
-		} else if (strcmp(key, "api_key_env") == 0) {
-			char *parsed = parse_toml_string(value);
-			if (parsed) {
-				free(target->api_key_env);
-				target->api_key_env = parsed;
-			}
-		} else if (strcmp(key, "adapter") == 0) {
-			char *parsed = parse_toml_string(value);
-			if (parsed) {
-				free(target->adapter);
-				target->adapter = parsed;
-			}
-		} else if (strcmp(key, "provider") == 0) {
-			char *parsed = parse_toml_string(value);
-			if (parsed) {
-				free(target->provider);
-				target->provider = parsed;
-			}
-		}
-	}
-	free(copy);
-}
-
-static char *join_path(const char *a, const char *b)
-{
-	size_t alen = strlen(a);
-	size_t blen = strlen(b);
-	int slash = alen > 0 && a[alen - 1] != '/' && blen > 0 && b[0] != '/';
-	char *out = malloc(alen + blen + (size_t)slash + 1);
-	size_t pos;
-
+	out = malloc(value.len + 1);
 	if (!out)
 		return NULL;
-	memcpy(out, a, alen);
-	pos = alen;
-	if (slash)
-		out[pos++] = '/';
-	memcpy(out + pos, b, blen);
-	out[pos + blen] = '\0';
+	memcpy(out, value.ptr, value.len);
+	out[value.len] = '\0';
 	return out;
 }
 
-static char *expand_home(const char *path)
+static char *toml_string_at(const nb_toml *doc, const char *section,
+			    const char *key)
 {
-	const char *home;
-	struct passwd *pw;
+	nb_str keys[3];
+	nb_str value = {0};
+	const nb_toml_value *node;
 
-	if (path[0] != '~' || (path[1] != '/' && path[1] != '\0'))
-		return strdup(path);
-	home = getenv("HOME");
-	if (!home || !*home) {
-		pw = getpwuid(getuid());
-		home = pw ? pw->pw_dir : NULL;
-	}
-	if (!home || !*home)
+	if (!doc)
 		return NULL;
-	return join_path(home, path[1] == '/' ? path + 1 : "");
+	keys[0] = nb_str_from_cstr("model");
+	keys[1] = nb_str_from_cstr(section);
+	keys[2] = nb_str_from_cstr(key);
+	node = nb_toml_get_path(doc, keys, 3);
+	if (!nb_toml_get_string(node, &value) || value.len == 0)
+		return NULL;
+	return dup_nb_str(value);
+}
+
+static void free_model_keys(struct model_keys *keys)
+{
+	free(keys->api_key);
+	free(keys->api_key_env);
+	free(keys->adapter);
+	free(keys->provider);
+	keys->api_key = NULL;
+	keys->api_key_env = NULL;
+	keys->adapter = NULL;
+	keys->provider = NULL;
+}
+
+static int load_model_keys(const char *path, struct model_keys *text,
+			   struct model_keys *vision, char **error)
+{
+	nb_err parse_error = {0};
+	nb_toml *doc = nb_toml_load(path, &parse_error);
+
+	if (!doc) {
+		set_error(error, "无法读取当前 Morph 配置（或解析失败）");
+		return 0;
+	}
+	text->api_key = toml_string_at(doc, "text", "api_key");
+	text->api_key_env = toml_string_at(doc, "text", "api_key_env");
+	text->adapter = toml_string_at(doc, "text", "adapter");
+	text->provider = toml_string_at(doc, "text", "provider");
+	vision->api_key = toml_string_at(doc, "vision", "api_key");
+	vision->api_key_env = toml_string_at(doc, "vision", "api_key_env");
+	nb_toml_free(doc);
+	return 1;
+}
+
+/*
+ * The tool is only meaningful when the active text model uses Morph's DeepSeek
+ * adapter.  If adapter is omitted, Morph infers it from the provider: provider
+ * "deepseek" means the DeepSeek adapter.  Any other explicit adapter is refused
+ * before an HTTP request is made.
+ */
+static int deepseek_adapter_supported(const struct model_keys *text,
+				      char **error)
+{
+	const char *adapter = text->adapter && text->adapter[0]
+				      ? text->adapter
+				      : NULL;
+	const char *provider = text->provider && text->provider[0]
+				       ? text->provider
+				       : NULL;
+	int supported = adapter ? strcmp(adapter, "deepseek") == 0
+				: provider ? strcmp(provider, "deepseek") == 0
+					   : 0;
+
+	if (supported)
+		return 1;
+	if (error && !*error) {
+		nb_buf msg;
+		const char *text_value;
+
+		nb_buf_init(&msg);
+		nb_buf_append_cstr(&msg,
+				   "当前模型不支持 deepseek_web：需要 "
+				   "[model.text].adapter = \"deepseek\"（当前 ");
+		if (adapter) {
+			nb_buf_append_cstr(&msg, "adapter=");
+			nb_buf_append_cstr(&msg, adapter);
+		} else {
+			nb_buf_append_cstr(&msg, "adapter=未配置");
+		}
+		if (provider) {
+			nb_buf_append_cstr(&msg, ", provider=");
+			nb_buf_append_cstr(&msg, provider);
+		}
+		nb_buf_append_cstr(&msg, "）");
+		text_value = nb_buf_cstr(&msg);
+		*error = strdup(text_value ? text_value
+					   : "当前模型不支持 deepseek_web");
+		nb_buf_destroy(&msg);
+	}
+	return 0;
 }
 
 #ifdef __APPLE__
@@ -413,7 +170,8 @@ static char *argv_config_path(void)
 	char **argv = *_NSGetArgv();
 
 	for (int i = 1; i < argc; i++) {
-		if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) &&
+		if ((strcmp(argv[i], "-c") == 0 ||
+		     strcmp(argv[i], "--config") == 0) &&
 		    i + 1 < argc)
 			return strdup(argv[i + 1]);
 		if (strncmp(argv[i], "--config=", 9) == 0)
@@ -442,7 +200,8 @@ static char *argv_config_path(void)
 		p += strlen(p) + 1;
 	}
 	for (int i = 1; i < argc; i++) {
-		if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) &&
+		if ((strcmp(argv[i], "-c") == 0 ||
+		     strcmp(argv[i], "--config") == 0) &&
 		    i + 1 < argc)
 			return strdup(argv[i + 1]);
 		if (strncmp(argv[i], "--config=", 9) == 0)
@@ -452,174 +211,133 @@ static char *argv_config_path(void)
 }
 #endif
 
+static char *expand_path(const char *path)
+{
+	nb_buf expanded;
+	char *result = NULL;
+
+	nb_buf_init(&expanded);
+	if (nb_path_expand(&expanded, path, NULL) == NB_OK) {
+		const char *text = nb_buf_cstr(&expanded);
+		if (text)
+			result = strdup(text);
+	}
+	nb_buf_destroy(&expanded);
+	return result;
+}
+
 static char *config_path(void)
 {
 	const char *env = getenv("MORPH_CONFIG");
 	char *arg;
 	char *out;
-	const char *home;
-	struct passwd *pw;
 
 	if (env && *env)
-		return expand_home(env);
+		return expand_path(env);
 	env = getenv("MORPH_CONFIG_PATH");
 	if (env && *env)
-		return expand_home(env);
+		return expand_path(env);
 	arg = argv_config_path();
 	if (arg) {
-		out = expand_home(arg);
+		out = expand_path(arg);
 		free(arg);
 		return out;
 	}
-	home = getenv("HOME");
-	if (!home || !*home) {
-		pw = getpwuid(getuid());
-		home = pw ? pw->pw_dir : NULL;
-	}
-	if (!home || !*home)
-		return NULL;
-	return join_path(home, ".morph/config.toml");
-}
-
-static void free_model_keys(struct model_keys *keys)
-{
-	free(keys->api_key);
-	free(keys->api_key_env);
-	free(keys->adapter);
-	free(keys->provider);
-	keys->api_key = NULL;
-	keys->api_key_env = NULL;
-	keys->adapter = NULL;
-	keys->provider = NULL;
-}
-
-/*
- * The tool is only meaningful when the active text model uses Morph's DeepSeek
- * adapter.  If adapter is omitted, Morph infers it from the provider: provider
- * "deepseek" means the DeepSeek adapter.  Any other explicit adapter is refused
- * before an HTTP request is made.
- */
-static int deepseek_adapter_supported(const struct model_keys *text_keys,
-				      char **error)
-{
-	const char *adapter = text_keys->adapter && text_keys->adapter[0]
-				      ? text_keys->adapter
-				      : NULL;
-	const char *provider = text_keys->provider && text_keys->provider[0]
-				       ? text_keys->provider
-				       : NULL;
-	int supported = adapter ? strcmp(adapter, "deepseek") == 0
-				: provider ? strcmp(provider, "deepseek") == 0
-					   : 0;
-
-	if (supported)
-		return 1;
-	if (error) {
-		struct strbuf msg = {0};
-		sb_append_cstr(&msg,
-			       "当前模型不支持 deepseek_web：需要 [model.text].adapter = "
-			       "\"deepseek\"（当前 ");
-		if (adapter) {
-			sb_append_cstr(&msg, "adapter=");
-			sb_append_cstr(&msg, adapter);
-		} else {
-			sb_append_cstr(&msg, "adapter=未配置");
-		}
-		if (provider) {
-			sb_append_cstr(&msg, ", provider=");
-			sb_append_cstr(&msg, provider);
-		}
-		sb_append_cstr(&msg, "）");
-		*error = msg.data;
-	}
-	return 0;
+	return expand_path("~/.morph/config.toml");
 }
 
 static char *resolve_api_key(char **error)
 {
-	struct model_keys text_keys = {0};
-	struct model_keys vision_keys = {0};
+	struct model_keys text = {0};
+	struct model_keys vision = {0};
 	struct model_keys *chosen;
 	char *path = config_path();
-	char *text = path ? read_text_file(path) : NULL;
 	char *result = NULL;
 
-	if (!text) {
-		if (error)
-			*error = strdup("无法读取当前 Morph 配置，无法确认 "
-					"[model.text].adapter 是否为 deepseek");
+	if (!path) {
+		set_error(error, "无法确定当前 Morph 配置文件路径");
+		return NULL;
+	}
+	if (!load_model_keys(path, &text, &vision, error)) {
 		free(path);
 		return NULL;
 	}
-	parse_config(text, &text_keys, &vision_keys);
-	free(text);
-	if (!deepseek_adapter_supported(&text_keys, error)) {
-		free_model_keys(&text_keys);
-		free_model_keys(&vision_keys);
+	if (!deepseek_adapter_supported(&text, error)) {
+		free_model_keys(&text);
+		free_model_keys(&vision);
 		free(path);
 		return NULL;
 	}
-	if (text_keys.api_key || text_keys.api_key_env)
-		chosen = &text_keys;
+	if (text.api_key || text.api_key_env)
+		chosen = &text;
 	else
-		chosen = &vision_keys;
+		chosen = &vision;
 
 	if (chosen->api_key && chosen->api_key[0]) {
 		result = strdup(chosen->api_key);
 	} else if (chosen->api_key_env && chosen->api_key_env[0]) {
 		const char *value = getenv(chosen->api_key_env);
+
 		if (value && *value) {
 			result = strdup(value);
-		} else if (error) {
-			struct strbuf msg = {0};
-			sb_append_cstr(&msg, "config uses api_key_env=");
-			sb_append_cstr(&msg, chosen->api_key_env);
-			sb_append_cstr(&msg, " but that environment variable is not set");
-			*error = msg.data;
+		} else {
+			nb_buf msg;
+
+			nb_buf_init(&msg);
+			nb_buf_append_cstr(&msg, "config uses api_key_env=");
+			nb_buf_append_cstr(&msg, chosen->api_key_env);
+			nb_buf_append_cstr(
+				&msg,
+				" but that environment variable is not set");
+			set_error(error, nb_buf_cstr(&msg));
+			nb_buf_destroy(&msg);
 		}
 	}
 	if (!result && !(error && *error)) {
 		const char *value = getenv("DEEPSEEK_API_KEY");
+
 		if (value && *value) {
 			result = strdup(value);
-		} else if (error) {
-			struct strbuf msg = {0};
-			sb_append_cstr(&msg,
-				       "no DeepSeek API key found: set [model.text].api_key or "
-				       "[model.text].api_key_env");
+		} else {
+			nb_buf msg;
+
+			nb_buf_init(&msg);
+			nb_buf_append_cstr(
+				&msg,
+				"no DeepSeek API key found: set [model.text].api_key "
+				"or [model.text].api_key_env");
 			if (path) {
-				sb_append_cstr(&msg, " in ");
-				sb_append_cstr(&msg, path);
+				nb_buf_append_cstr(&msg, " in ");
+				nb_buf_append_cstr(&msg, path);
 			}
-			sb_append_cstr(&msg, ", or export DEEPSEEK_API_KEY");
-			*error = msg.data;
+			nb_buf_append_cstr(&msg,
+					   ", or export DEEPSEEK_API_KEY");
+			set_error(error, nb_buf_cstr(&msg));
+			nb_buf_destroy(&msg);
 		}
 	}
-	free_model_keys(&text_keys);
-	free_model_keys(&vision_keys);
+	free_model_keys(&text);
+	free_model_keys(&vision);
 	free(path);
 	return result;
 }
 
-static void set_error(char **error, const char *message)
+static size_t http_write_cb(char *ptr, size_t size, size_t nmemb,
+			    void *userdata)
 {
-	if (error && !*error)
-		*error = strdup(message);
-}
-
-static size_t http_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
-{
-	struct http_buffer *response = userdata;
+	nb_buf *body = userdata;
 	size_t n;
 
 	if (size && nmemb > SIZE_MAX / size)
 		return 0;
 	n = size * nmemb;
-	if (n > MAX_RESPONSE_BYTES - response->body.len ||
-	    !sb_append(&response->body, ptr, n)) {
-		response->oom = 1;
+	if (nb_buf_len(body) > MAX_RESPONSE_BYTES ||
+	    n > MAX_RESPONSE_BYTES - nb_buf_len(body)) {
+		nb_buf_set_error(body, NB_ERR_TOO_BIG);
 		return 0;
 	}
+	if (!nb_buf_append(body, ptr, n))
+		return 0;
 	return n;
 }
 
@@ -649,36 +367,55 @@ static char *post_json(const char *url, const char *api_key, const char *body,
 {
 	CURL *curl;
 	struct curl_slist *headers = NULL;
-	struct http_buffer response = {0};
-	char auth[2048];
+	nb_buf response;
+	nb_buf auth;
+	char *auth_header = NULL;
 	CURLcode rc;
 	long status = 0;
 	char *result = NULL;
 
+	nb_buf_init(&response);
+	nb_buf_init(&auth);
 	curl = curl_easy_init();
 	if (!curl) {
 		set_error(error, "curl initialization failed");
-		return NULL;
+		goto cleanup;
 	}
 	if (strchr(api_key, '\r') || strchr(api_key, '\n')) {
-		curl_easy_cleanup(curl);
 		set_error(error, "API key contains a line break");
-		return NULL;
+		goto cleanup;
 	}
-	if (snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key) >=
-	    (int)sizeof(auth)) {
-		curl_easy_cleanup(curl);
+	if (!nb_buf_append_cstr(&auth, "Authorization: ") ||
+	    !nb_buf_append_cstr(&auth, "Bearer ") ||
+	    !nb_buf_append_cstr(&auth, api_key) ||
+	    nb_buf_len(&auth) > 4096) {
 		set_error(error, "API key is too long");
-		return NULL;
+		goto cleanup;
 	}
-	headers = curl_slist_append(headers, "Content-Type: application/json");
-	headers = curl_slist_append(headers, "Accept: application/json");
-	headers = curl_slist_append(headers, auth);
-	if (!headers) {
-		curl_easy_cleanup(curl);
+	auth_header = strdup(nb_buf_cstr(&auth));
+	if (!auth_header) {
+		set_error(error, "out of memory");
+		goto cleanup;
+	}
+	struct curl_slist *tmp =
+		curl_slist_append(headers, "Content-Type: application/json");
+	if (!tmp) {
 		set_error(error, "failed to build HTTP headers");
-		return NULL;
+		goto cleanup;
 	}
+	headers = tmp;
+	tmp = curl_slist_append(headers, "Accept: application/json");
+	if (!tmp) {
+		set_error(error, "failed to build HTTP headers");
+		goto cleanup;
+	}
+	headers = tmp;
+	tmp = curl_slist_append(headers, auth_header);
+	if (!tmp) {
+		set_error(error, "failed to build HTTP headers");
+		goto cleanup;
+	}
+	headers = tmp;
 	curl_easy_setopt(curl, CURLOPT_URL, url);
 	curl_easy_setopt(curl, CURLOPT_POST, 1L);
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
@@ -694,43 +431,48 @@ static char *post_json(const char *url, const char *api_key, const char *body,
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 	rc = curl_easy_perform(curl);
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-	curl_slist_free_all(headers);
-	curl_easy_cleanup(curl);
-	memset(auth, 0, sizeof(auth));
 
-	if (response.oom) {
-		set_error(error, "DeepSeek response exceeds the 8 MiB limit");
+	if (!nb_buf_ok(&response)) {
+		set_error(error,
+			  "DeepSeek response exceeds the 8 MiB limit");
 	} else if (rc != CURLE_OK) {
-		struct strbuf msg = {0};
-		sb_append_cstr(&msg, "DeepSeek request failed: ");
-		sb_append_cstr(&msg, curl_easy_strerror(rc));
-		if (error && !*error)
-			*error = msg.data;
-		else
-			sb_free(&msg);
+		nb_buf msg;
+
+		nb_buf_init(&msg);
+		nb_buf_printf(&msg, "DeepSeek request failed: %s",
+			      curl_easy_strerror(rc));
+		set_error(error, nb_buf_cstr(&msg));
+		nb_buf_destroy(&msg);
 	} else if (status != 200) {
-		struct strbuf msg = {0};
-		char status_text[64];
-		size_t n;
-		snprintf(status_text, sizeof(status_text), "DeepSeek API returned HTTP %ld",
-			 status);
-		sb_append_cstr(&msg, status_text);
-		if (response.body.data && response.body.len) {
-			sb_append_cstr(&msg, ": ");
-			n = response.body.len > 2000 ? 2000 : response.body.len;
-			sb_append(&msg, response.body.data, n);
+		nb_buf msg;
+
+		nb_buf_init(&msg);
+		nb_buf_append_cstr(&msg, "DeepSeek API returned HTTP ");
+		nb_buf_append_i64(&msg, (int64_t)status);
+		if (nb_buf_len(&response) > 0) {
+			size_t n = nb_buf_len(&response) > 2000
+					   ? 2000
+					   : nb_buf_len(&response);
+			nb_buf_append_cstr(&msg, ": ");
+			nb_buf_append(&msg, nb_buf_cstr(&response), n);
 		}
-		if (error && !*error)
-			*error = msg.data;
-		else
-			sb_free(&msg);
-	} else if (!response.body.data || response.body.len == 0) {
+		set_error(error, nb_buf_cstr(&msg));
+		nb_buf_destroy(&msg);
+	} else if (nb_buf_len(&response) == 0) {
 		set_error(error, "DeepSeek returned an empty response");
 	} else {
-		result = response.body.data;
-		response.body.data = NULL;
+		result = strdup(nb_buf_cstr(&response));
 	}
-	sb_free(&response.body);
+
+cleanup:
+	curl_slist_free_all(headers);
+	curl_easy_cleanup(curl);
+	if (auth_header) {
+		memset(auth_header, 0, strlen(auth_header));
+		free(auth_header);
+	}
+	nb_buf_destroy(&auth);
+	nb_buf_destroy(&response);
 	return result;
 }
 
@@ -740,8 +482,9 @@ static char *error_json(const char *message)
 	char *text;
 
 	if (!root)
-		return NULL;
-	cJSON_AddStringToObject(root, "error", message ? message : "unknown error");
+		return strdup("{\"error\":\"out of memory\"}");
+	cJSON_AddStringToObject(root, "error",
+				message ? message : "unknown error");
 	text = cJSON_PrintUnformatted(root);
 	cJSON_Delete(root);
 	return text;
@@ -751,7 +494,8 @@ static const char *json_string(cJSON *root, const char *name)
 {
 	cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
 
-	return cJSON_IsString(item) && item->valuestring ? item->valuestring : NULL;
+	return cJSON_IsString(item) && item->valuestring ? item->valuestring
+							 : NULL;
 }
 
 static int json_int(cJSON *root, const char *name, int fallback)
@@ -798,18 +542,21 @@ int ext_run(const char *args_json, char **result_json)
 	query = json_string(args, "query");
 	url = json_string(args, "url");
 	if (!action || !*action)
-		action = (url && *url && (!query || !*query)) ? "fetch" : "search";
+		action = (url && *url && (!query || !*query)) ? "fetch"
+							     : "search";
 	if (strcmp(action, "search") == 0) {
 		is_fetch = 0;
 	} else if (strcmp(action, "fetch") == 0) {
 		is_fetch = 1;
 	} else {
-		*result_json = error_json("action must be \"search\" or \"fetch\"");
+		*result_json =
+			error_json("action must be \"search\" or \"fetch\"");
 		goto done;
 	}
 	if (is_fetch) {
 		if (!url || !*url) {
-			*result_json = error_json("fetch requires a non-empty url");
+			*result_json =
+				error_json("fetch requires a non-empty url");
 			goto done;
 		}
 	} else if (!query || !*query) {
@@ -820,7 +567,8 @@ int ext_run(const char *args_json, char **result_json)
 
 	api_key = resolve_api_key(&key_error);
 	if (!api_key) {
-		*result_json = error_json(key_error ? key_error : "missing API key");
+		*result_json =
+			error_json(key_error ? key_error : "missing API key");
 		goto done;
 	}
 
@@ -834,8 +582,10 @@ int ext_run(const char *args_json, char **result_json)
 		cJSON_AddStringToObject(body, "url", url);
 	} else {
 		int count = json_int(args, "count", 10);
-		const char *ori_question = json_string(args, "ori_question");
-		const char *localization = json_string(args, "localization");
+		const char *ori_question =
+			json_string(args, "ori_question");
+		const char *localization =
+			json_string(args, "localization");
 
 		if (count < 1)
 			count = 1;
@@ -846,9 +596,11 @@ int ext_run(const char *args_json, char **result_json)
 		cJSON_AddBoolToObject(body, "need_content",
 				      json_bool(args, "need_content", 0));
 		if (ori_question && *ori_question)
-			cJSON_AddStringToObject(body, "ori_question", ori_question);
+			cJSON_AddStringToObject(body, "ori_question",
+						ori_question);
 		if (localization && *localization)
-			cJSON_AddStringToObject(body, "localization", localization);
+			cJSON_AddStringToObject(body, "localization",
+						localization);
 	}
 	body_text = cJSON_PrintUnformatted(body);
 	request_url =
@@ -861,7 +613,8 @@ int ext_run(const char *args_json, char **result_json)
 	response = post_json(request_url, api_key, body_text, &http_error);
 	if (!response) {
 		*result_json =
-			error_json(http_error ? http_error : "DeepSeek request failed");
+			error_json(http_error ? http_error
+					      : "DeepSeek request failed");
 	} else {
 		*result_json = response;
 		response = NULL;
