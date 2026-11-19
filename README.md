@@ -36,9 +36,11 @@ make install
 
 ## SDK
 
-`sdk/include/morph/ext.h` 和 `ext_types.h` 是 Morph `include/morph/` 的公开
-头文件副本。它们声明 ABI，不参与编译 Morph，也不链接 Morph 私有库。
-更新 SDK 时应从 Morph 导出产物同步，不能复制或猜测内部 `struct config` 布局。
+`sdk/manifest.json` 固定 SDK 1.1.0、ABI 1、nbase 公共声明的来源和所有头文件
+的 SHA-256。随插件提交整个 `sdk/`，避免构建时自动跟随 SDK 升级。
+这些文件来自 `morph-ext-development` skill 自带的版本化 SDK 包，不参与编译
+Morph，也不链接 Morph 私有库。更新时使用 skill 内的 `scripts/scaffold.py sdk`
+选择确切版本，再通过 `check` 校验；不能复制或猜测内部 `struct config` 布局。
 可用 `MORPH_SDK=/path/to/exported/include` 替换随包头文件。
 
 插件通过 `struct_size` 检查宿主是否提供配置接口；旧宿主会收到明确的升级提示。
