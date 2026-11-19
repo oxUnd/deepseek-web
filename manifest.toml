@@ -1,6 +1,6 @@
 name = "deepseek_web"
-version = "1.0.0"
-description = "Search the web or fetch a page through DeepSeek's Search/Fetch API. Reads the DeepSeek API key from Morph's active config."
+version = "2.0.0"
+description = "Search the web or fetch a page through DeepSeek's Search/Fetch API via the context-aware ext_run_v2 interface."
 author = "morph"
 type = "so"
 entry = "deepseek_web.so"
