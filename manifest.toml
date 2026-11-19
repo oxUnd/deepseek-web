@@ -1,0 +1,17 @@
+name = "deepseek_web"
+version = "1.0.0"
+description = "Search the web or fetch a page through DeepSeek's Search/Fetch API. Reads the DeepSeek API key from Morph's active config."
+author = "morph"
+type = "so"
+entry = "deepseek_web.so"
+fronts = ["cli"]
+categories = ["web", "search"]
+sandbox_capabilities = ["network"]
+max_memory_mb = 128
+max_cpu_seconds = 60
+max_open_files = 64
+input_schema = "{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"search\",\"fetch\"],\"description\":\"search the web or fetch one URL\"},\"query\":{\"type\":\"string\",\"description\":\"search query (action=search)\"},\"url\":{\"type\":\"string\",\"description\":\"URL to fetch (action=fetch)\"},\"count\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":50,\"description\":\"number of results, default 10\"},\"need_content\":{\"type\":\"boolean\",\"description\":\"include page content in each search result\"},\"ori_question\":{\"type\":\"string\",\"description\":\"the original user question, for search intent\"},\"localization\":{\"type\":\"string\",\"description\":\"IP address used to localize results\"}},\"required\":[\"action\"]}"
+output_schema = "{\"type\":\"object\",\"properties\":{}}"
+
+[build]
+command = "make"
