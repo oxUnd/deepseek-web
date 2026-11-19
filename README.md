@@ -58,31 +58,39 @@ Morph 原生扩展（`type = "so"`），把 DeepSeek 的
 ### 依赖
 
 - C 编译器与 `make`
-- nbase（Morph 依赖的基础库，默认 `~/Work/c-family/nothing`）
-  - 头文件：`include/nb`
-  - 静态库：`build/libnbase.a`
+- `curl` 与 `tar`：下载并解压 nbase
+- `cmake` ≥ 3.20：构建 nbase
+- nbase v0.1.0（构建时自动从 Codeberg 下载，不使用 git）
 - libcurl（macOS 使用系统 SDK；Linux 需要 libcurl 开发包）
 - Morph 0.5.0（当前验证版本）
 
 ### 构建
 
 ```bash
-# 1. 构建 nbase（如果还没有 build/libnbase.a）
-cd ~/Work/c-family/nothing
-cmake -S . -B build
-cmake --build build
-
-# 2. 构建扩展
-cd /path/to/deepseek-web
 make
 ```
 
-生成的产物是 `deepseek_web.so`。nbase 以静态库方式链入扩展，所以安装后
-不需要额外的 nbase dylib。nbase 不在默认路径时：
+构建过程会：
+
+1. 下载 `https://codeberg.org/oxund/nothing/archive/v0.1.0.tar.gz`
+2. 解压到 `.deps/nothing-v0.1.0`
+3. 用 CMake 构建静态库 `.deps/nothing-v0.1.0/build/libnbase.a`
+4. 把 nbase 静态链入 `deepseek_web.so`
+
+**依赖获取不使用 git**，只用到 `curl`、`tar` 和 `cmake`。nbase 以静态库方式
+链入扩展，所以安装后不需要额外的 nbase dylib。需要清理下载内容时：
+
+```bash
+make distclean
+```
+
+如果已经有本地 nbase 源码，可以跳过下载：
 
 ```bash
 make NBASE_DIR=/path/to/nothing
 ```
+
+也可以通过 `NBASE_VERSION` / `NBASE_URL` 覆盖版本和归档地址。
 
 `cJSON` 已随扩展目录提供，不需要额外安装；libcurl 使用系统库。
 
@@ -93,12 +101,46 @@ make NBASE_DIR=/path/to/nothing
 - nbase 目前没有 JSON API，所以工具参数、请求体和错误 JSON 继续使用 cJSON。
 - nbase 目前没有 HTTP 客户端，所以请求继续使用 libcurl。
 
-### 安装
+### 安装（推荐：Morph 自带 `/ext install`）
+
+在 Morph 会话中执行：
+
+```text
+/ext install github:oxUnd/deepseek-web@main --yes
+```
+
+安装器会：
+
+1. 用 git 拉取 GitHub 仓库（扩展仓库本身使用 git；nbase 依赖仍由 Makefile
+   用 `curl + tar` 获取）
+2. 读取根目录的 `manifest.toml`
+3. 在临时目录执行 `[build] command`
+4. 检查 `deepseek_web.so`
+5. 安装到 `~/.morph/exts/deepseek_web`（目录名来自 manifest 的 `name`）
+
+注意：
+
+- `/ext install` 只支持 GitHub，不支持 Codeberg、本地路径或 tarball。
+- 如果之前手动安装过 `~/.morph/exts/deepseek-web`，先删除该目录，避免同名
+  工具重复加载。
+- 安装器要求目标目录不存在；0.5.0 的 `/ext remove` 尚未实现，卸载需手动
+  删除目录。
+- 构建需要 `make`、`curl`、`tar`、`cmake` 和 libcurl；`--yes` 跳过构建确认。
+- manifest 的 build command 会清理 `.deps` 和 `.o`，安装目录不会带入依赖
+  源码和中间对象。
+
+### 手动安装（不使用 git / 离线）
+
+如果不想让 Morph 安装器用 git 拉仓库，可以本地构建后手动复制：
 
 ```bash
+make
 mkdir -p ~/.morph/exts/deepseek-web
 cp manifest.toml deepseek_web.so ~/.morph/exts/deepseek-web/
 ```
+
+手动安装和 `/ext install` 二选一；不要同时保留 `deepseek-web` 与
+`deepseek_web` 两个目录。
 
 ### 重启并确认
 
@@ -295,6 +337,7 @@ python3 test_deepseek_web.py --real
 
 ```text
 deepseek-web/
+├── .deps/                 # 下载并构建的 nbase（不入库）
 ├── README.md
 ├── manifest.toml          # 工具名、schema、权限、入口
 ├── Makefile               # 构建 deepseek_web.so

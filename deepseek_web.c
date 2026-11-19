@@ -362,6 +362,20 @@ static char *build_url(const char *endpoint)
 	return url;
 }
 
+static void post_json_cleanup(CURL *curl, struct curl_slist *headers,
+			      char *auth_header, nb_buf *auth, nb_buf *response)
+{
+	curl_slist_free_all(headers);
+	if (curl)
+		curl_easy_cleanup(curl);
+	if (auth_header) {
+		memset(auth_header, 0, strlen(auth_header));
+		free(auth_header);
+	}
+	nb_buf_destroy(auth);
+	nb_buf_destroy(response);
+}
+
 static char *post_json(const char *url, const char *api_key, const char *body,
 		       char **error)
 {
@@ -379,41 +393,48 @@ static char *post_json(const char *url, const char *api_key, const char *body,
 	curl = curl_easy_init();
 	if (!curl) {
 		set_error(error, "curl initialization failed");
-		goto cleanup;
+		post_json_cleanup(NULL, NULL, NULL, &auth, &response);
+		return NULL;
 	}
 	if (strchr(api_key, '\r') || strchr(api_key, '\n')) {
 		set_error(error, "API key contains a line break");
-		goto cleanup;
+		post_json_cleanup(curl, headers, auth_header, &auth, &response);
+		return NULL;
 	}
 	if (!nb_buf_append_cstr(&auth, "Authorization: ") ||
 	    !nb_buf_append_cstr(&auth, "Bearer ") ||
 	    !nb_buf_append_cstr(&auth, api_key) ||
 	    nb_buf_len(&auth) > 4096) {
 		set_error(error, "API key is too long");
-		goto cleanup;
+		post_json_cleanup(curl, headers, auth_header, &auth, &response);
+		return NULL;
 	}
 	auth_header = strdup(nb_buf_cstr(&auth));
 	if (!auth_header) {
 		set_error(error, "out of memory");
-		goto cleanup;
+		post_json_cleanup(curl, headers, NULL, &auth, &response);
+		return NULL;
 	}
 	struct curl_slist *tmp =
 		curl_slist_append(headers, "Content-Type: application/json");
 	if (!tmp) {
 		set_error(error, "failed to build HTTP headers");
-		goto cleanup;
+		post_json_cleanup(curl, headers, auth_header, &auth, &response);
+		return NULL;
 	}
 	headers = tmp;
 	tmp = curl_slist_append(headers, "Accept: application/json");
 	if (!tmp) {
 		set_error(error, "failed to build HTTP headers");
-		goto cleanup;
+		post_json_cleanup(curl, headers, auth_header, &auth, &response);
+		return NULL;
 	}
 	headers = tmp;
 	tmp = curl_slist_append(headers, auth_header);
 	if (!tmp) {
 		set_error(error, "failed to build HTTP headers");
-		goto cleanup;
+		post_json_cleanup(curl, headers, auth_header, &auth, &response);
+		return NULL;
 	}
 	headers = tmp;
 	curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -464,15 +485,9 @@ static char *post_json(const char *url, const char *api_key, const char *body,
 		result = strdup(nb_buf_cstr(&response));
 	}
 
-cleanup:
-	curl_slist_free_all(headers);
-	curl_easy_cleanup(curl);
-	if (auth_header) {
-		memset(auth_header, 0, strlen(auth_header));
-		free(auth_header);
-	}
-	nb_buf_destroy(&auth);
-	nb_buf_destroy(&response);
+	if (!result)
+		set_error(error, "out of memory");
+	post_json_cleanup(curl, headers, auth_header, &auth, &response);
 	return result;
 }
 
@@ -514,33 +529,55 @@ static int json_bool(cJSON *root, const char *name, int fallback)
 	return fallback;
 }
 
+struct ext_run_resources {
+	cJSON *args;
+	cJSON *body;
+	char *body_text;
+	char *request_url;
+	char *api_key;
+	char *key_error;
+	char *http_error;
+	char *response;
+};
+
+static void ext_run_resources_cleanup(struct ext_run_resources *resources)
+{
+	if (!resources)
+		return;
+	if (resources->api_key) {
+		memset(resources->api_key, 0, strlen(resources->api_key));
+		free(resources->api_key);
+	}
+	free(resources->key_error);
+	free(resources->http_error);
+	free(resources->response);
+	free(resources->body_text);
+	free(resources->request_url);
+	cJSON_Delete(resources->body);
+	cJSON_Delete(resources->args);
+	memset(resources, 0, sizeof(*resources));
+}
+
 int ext_run(const char *args_json, char **result_json)
 {
-	cJSON *args = NULL;
-	cJSON *body = NULL;
+	struct ext_run_resources resources = {0};
 	const char *action;
 	const char *query;
 	const char *url;
-	char *body_text = NULL;
-	char *request_url = NULL;
-	char *api_key = NULL;
-	char *key_error = NULL;
-	char *http_error = NULL;
-	char *response = NULL;
-	int is_fetch;
-	int rc = 0;
+	int is_fetch = 0;
 
 	if (!args_json || !result_json)
 		return -1;
 	*result_json = NULL;
-	args = cJSON_Parse(args_json);
-	if (!args || !cJSON_IsObject(args)) {
+	resources.args = cJSON_Parse(args_json);
+	if (!resources.args || !cJSON_IsObject(resources.args)) {
 		*result_json = error_json("invalid JSON arguments");
-		goto done;
+		ext_run_resources_cleanup(&resources);
+		return 0;
 	}
-	action = json_string(args, "action");
-	query = json_string(args, "query");
-	url = json_string(args, "url");
+	action = json_string(resources.args, "action");
+	query = json_string(resources.args, "query");
+	url = json_string(resources.args, "url");
 	if (!action || !*action)
 		action = (url && *url && (!query || !*query)) ? "fetch"
 							     : "search";
@@ -551,86 +588,82 @@ int ext_run(const char *args_json, char **result_json)
 	} else {
 		*result_json =
 			error_json("action must be \"search\" or \"fetch\"");
-		goto done;
+		ext_run_resources_cleanup(&resources);
+		return 0;
 	}
 	if (is_fetch) {
 		if (!url || !*url) {
 			*result_json =
 				error_json("fetch requires a non-empty url");
-			goto done;
+			ext_run_resources_cleanup(&resources);
+			return 0;
 		}
 	} else if (!query || !*query) {
 		*result_json =
 			error_json("search requires a non-empty query");
-		goto done;
+		ext_run_resources_cleanup(&resources);
+		return 0;
 	}
 
-	api_key = resolve_api_key(&key_error);
-	if (!api_key) {
+	resources.api_key = resolve_api_key(&resources.key_error);
+	if (!resources.api_key) {
 		*result_json =
-			error_json(key_error ? key_error : "missing API key");
-		goto done;
+			error_json(resources.key_error ? resources.key_error
+						       : "missing API key");
+		ext_run_resources_cleanup(&resources);
+		return 0;
 	}
 
-	body = cJSON_CreateObject();
-	if (!body) {
+	resources.body = cJSON_CreateObject();
+	if (!resources.body) {
 		*result_json = error_json("out of memory");
-		rc = -1;
-		goto done;
+		ext_run_resources_cleanup(&resources);
+		return -1;
 	}
 	if (is_fetch) {
-		cJSON_AddStringToObject(body, "url", url);
+		cJSON_AddStringToObject(resources.body, "url", url);
 	} else {
-		int count = json_int(args, "count", 10);
+		int count = json_int(resources.args, "count", 10);
 		const char *ori_question =
-			json_string(args, "ori_question");
+			json_string(resources.args, "ori_question");
 		const char *localization =
-			json_string(args, "localization");
+			json_string(resources.args, "localization");
 
 		if (count < 1)
 			count = 1;
 		if (count > 50)
 			count = 50;
-		cJSON_AddStringToObject(body, "query", query);
-		cJSON_AddNumberToObject(body, "count", count);
-		cJSON_AddBoolToObject(body, "need_content",
-				      json_bool(args, "need_content", 0));
+		cJSON_AddStringToObject(resources.body, "query", query);
+		cJSON_AddNumberToObject(resources.body, "count", count);
+		cJSON_AddBoolToObject(
+			resources.body, "need_content",
+			json_bool(resources.args, "need_content", 0));
 		if (ori_question && *ori_question)
-			cJSON_AddStringToObject(body, "ori_question",
+			cJSON_AddStringToObject(resources.body, "ori_question",
 						ori_question);
 		if (localization && *localization)
-			cJSON_AddStringToObject(body, "localization",
+			cJSON_AddStringToObject(resources.body, "localization",
 						localization);
 	}
-	body_text = cJSON_PrintUnformatted(body);
-	request_url =
+	resources.body_text = cJSON_PrintUnformatted(resources.body);
+	resources.request_url =
 		build_url(is_fetch ? "/v1/tools/fetch" : "/v1/tools/search");
-	if (!body_text || !request_url) {
+	if (!resources.body_text || !resources.request_url) {
 		*result_json = error_json("out of memory");
-		rc = -1;
-		goto done;
+		ext_run_resources_cleanup(&resources);
+		return -1;
 	}
-	response = post_json(request_url, api_key, body_text, &http_error);
-	if (!response) {
+	resources.response = post_json(
+		resources.request_url, resources.api_key, resources.body_text,
+		&resources.http_error);
+	if (!resources.response) {
 		*result_json =
-			error_json(http_error ? http_error
-					      : "DeepSeek request failed");
+			error_json(resources.http_error ? resources.http_error
+							: "DeepSeek request failed");
 	} else {
-		*result_json = response;
-		response = NULL;
+		*result_json = resources.response;
+		resources.response = NULL;
 	}
-
-done:
-	if (api_key) {
-		memset(api_key, 0, strlen(api_key));
-		free(api_key);
-	}
-	free(key_error);
-	free(http_error);
-	free(response);
-	free(body_text);
-	free(request_url);
-	cJSON_Delete(body);
-	cJSON_Delete(args);
-	return rc;
+	ext_run_resources_cleanup(&resources);
+	return 0;
 }
