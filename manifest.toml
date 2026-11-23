@@ -1,5 +1,5 @@
 name = "deepseek_web"
-version = "2.0.0"
+version = "3.0.0"
 description = "Search the web or fetch a page through DeepSeek's Search/Fetch API via the context-aware ext_run_v2 interface."
 author = "morph"
 type = "so"

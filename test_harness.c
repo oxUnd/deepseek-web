@@ -8,6 +8,7 @@
 #include <morph/ext.h>
 
 #include <nb/err.h>
+#include <nb/time.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -15,9 +16,17 @@
 int ext_run_v2(const struct ext_context *context, const char *args_json,
 	       char **result_json);
 
+struct harness_call {
+	int64_t start_ms;
+	int64_t cancel_after_ms;
+};
+
 static int harness_check_cancelled(void *host_data)
 {
-	(void)host_data;
+	struct harness_call *call = host_data;
+	if (call->cancel_after_ms >= 0 &&
+	    nb_time_monotonic_ms() - call->start_ms >= call->cancel_after_ms)
+		return NB_ERR_CANCELLED;
 	return NB_OK;
 }
 
@@ -57,10 +66,15 @@ static const char *harness_get_config_string(void *host_data, const char *path)
 	return NULL;
 }
 
-int harness_run(const char *args_json, char **result_json)
+NB_EXPORT int harness_run(const char *args_json, char **result_json)
 {
 	struct ext_host_api host = {0};
 	struct ext_context context = {0};
+	struct harness_call call = {.start_ms = nb_time_monotonic_ms(),
+				    .cancel_after_ms = -1};
+	const char *cancel_after = env_value("HARNESS_CANCEL_AFTER_MS");
+	if (*cancel_after)
+		call.cancel_after_ms = strtoll(cancel_after, NULL, 10);
 
 	host.abi_version = EXT_CONTEXT_ABI_VERSION;
 	host.struct_size = sizeof(host);
@@ -76,6 +90,10 @@ int harness_run(const char *args_json, char **result_json)
 	context.abi_version = EXT_CONTEXT_ABI_VERSION;
 	context.struct_size = sizeof(context);
 	context.host = &host;
+	context.host_data = &call;
+	const char *deadline = env_value("HARNESS_DEADLINE_MS");
+	if (*deadline)
+		context.call.deadline_ms = call.start_ms + strtoll(deadline, NULL, 10);
 
 	return ext_run_v2(&context, args_json, result_json);
 }

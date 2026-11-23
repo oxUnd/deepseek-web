@@ -2,43 +2,47 @@
 
 #include "cJSON.h"
 #include <morph/ext.h>
-
-#include <curl/curl.h>
-#include <nb/buf.h>
 #include <nb/err.h>
+#include <nb/http.h>
+#include <nb/str.h>
 #include <nb/time.h>
 
+#include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define DEFAULT_API_BASE "https://api.deepseek.com"
 #define MAX_RESPONSE_BYTES (8u * 1024u * 1024u)
-#define DEFAULT_TIMEOUT_MS 60000L
-#define CONNECT_TIMEOUT_MS 15000L
+#define DEFAULT_TIMEOUT_MS 60000
+#define CONNECT_TIMEOUT_MS 15000
+#define POLL_INTERVAL_MS 50
 
-/*
- * Morph's context-aware native extension ABI:
- *
- *     int ext_run_v2(const struct ext_context *context,
- *                    const char *args_json, char **result_json);
- *
- * The host exposes the effective configuration through get_config_string, so
- * the tool never depends on private config layouts or probes config files.
- * The API key
- * and the selected adapter come from [model.text], with [model.vision] as a
- * key-only fallback; DEEPSEEK_API_KEY remains the last resort.
- *
- * nbase supplies buffers and monotonic time, cJSON parses arguments, and
- * libcurl performs the HTTP request.
- */
-
+/* Config strings are borrowed from this invocation's effective host snapshot.
+ * nbase supplies HTTP and monotonic time; cJSON parses arguments. */
 static void set_error(char **error, const char *message)
 {
-	if (error && !*error) {
-		const char *text = message ? message : "unknown error";
-		*error = strdup(text);
+	if (error && !*error)
+		*error = strdup(message ? message : "unknown error");
+}
+
+static void set_errorf(char **error, const char *format, ...)
+{
+	if (!error || *error)
+		return;
+	va_list args;
+	va_list copy;
+	va_start(args, format);
+	va_copy(copy, args);
+	int length = vsnprintf(NULL, 0, format, copy);
+	va_end(copy);
+	if (length >= 0) {
+		*error = malloc((size_t)length + 1);
+		if (*error)
+			vsnprintf(*error, (size_t)length + 1, format, args);
 	}
+	va_end(args);
 }
 
 static char *error_json(const char *message)
@@ -105,30 +109,10 @@ static int deepseek_adapter_supported(const struct ext_context *context,
 
 	if (supported)
 		return 1;
-	if (error && !*error) {
-		nb_buf msg;
-		const char *text_value;
-
-		nb_buf_init(&msg);
-		nb_buf_append_cstr(&msg,
-				   "当前模型不支持 deepseek_web：需要 "
-				   "[model.text].adapter = \"deepseek\"（当前 ");
-		if (adapter) {
-			nb_buf_append_cstr(&msg, "adapter=");
-			nb_buf_append_cstr(&msg, adapter);
-		} else {
-			nb_buf_append_cstr(&msg, "adapter=未配置");
-		}
-		if (provider) {
-			nb_buf_append_cstr(&msg, ", provider=");
-			nb_buf_append_cstr(&msg, provider);
-		}
-		nb_buf_append_cstr(&msg, "）");
-		text_value = nb_buf_cstr(&msg);
-		*error = strdup(text_value ? text_value
-					   : "当前模型不支持 deepseek_web");
-		nb_buf_destroy(&msg);
-	}
+	set_errorf(error, "deepseek_web requires the DeepSeek adapter: set "
+		   "[model.text].adapter = \"deepseek\" (current adapter=%s%s%s)",
+		   adapter ? adapter : "not configured", provider ? ", provider=" : "",
+		   provider ? provider : "");
 	return 0;
 }
 
@@ -169,25 +153,6 @@ static char *resolve_api_key(const struct ext_context *context, char **error)
 	return key;
 }
 
-static size_t http_write_cb(char *ptr, size_t size, size_t nmemb,
-			    void *userdata)
-{
-	nb_buf *body = userdata;
-	size_t n;
-
-	if (size && nmemb > SIZE_MAX / size)
-		return 0;
-	n = size * nmemb;
-	if (nb_buf_len(body) > MAX_RESPONSE_BYTES ||
-	    n > MAX_RESPONSE_BYTES - nb_buf_len(body)) {
-		nb_buf_set_error(body, NB_ERR_TOO_BIG);
-		return 0;
-	}
-	if (!nb_buf_append(body, ptr, n))
-		return 0;
-	return n;
-}
-
 static char *build_url(const char *endpoint)
 {
 	const char *base = getenv("DEEPSEEK_API_BASE");
@@ -209,204 +174,155 @@ static char *build_url(const char *endpoint)
 	return url;
 }
 
-struct http_call {
-	const struct ext_context *context;
-	int cancel_status;
+struct http_resources {
+	nb_http_client *client;
+	nb_http_call *call;
+	char *auth;
 };
 
-static int http_progress_cb(void *userdata, curl_off_t dltotal,
-			    curl_off_t dlnow, curl_off_t ultotal,
-			    curl_off_t ulnow)
+static void http_resources_cleanup(struct http_resources *resources)
 {
-	struct http_call *call = userdata;
-	int rc;
-
-	(void)dltotal;
-	(void)dlnow;
-	(void)ultotal;
-	(void)ulnow;
-	rc = call->context->host->check_cancelled(call->context->host_data);
-	if (rc != NB_OK) {
-		call->cancel_status = rc;
-		return 1;
+	/* Freeing an unfinished call cancels it without dispatching callbacks. */
+	nb_http_call_free(resources->call);
+	nb_http_client_free(resources->client);
+	if (resources->auth) {
+		memset(resources->auth, 0, strlen(resources->auth));
+		free(resources->auth);
 	}
-	return 0;
 }
 
-static void post_json_cleanup(CURL *curl, struct curl_slist *headers,
-			      char *auth_header, nb_buf *auth, nb_buf *response)
+static int request_cancelled(const struct ext_context *context)
 {
-	curl_slist_free_all(headers);
-	if (curl)
-		curl_easy_cleanup(curl);
-	if (auth_header) {
-		memset(auth_header, 0, strlen(auth_header));
-		free(auth_header);
-	}
-	nb_buf_destroy(auth);
-	nb_buf_destroy(response);
+	int rc = context->host->check_cancelled(context->host_data);
+	if (rc != NB_OK)
+		return rc;
+	if (context->call.deadline_ms > 0 &&
+	    nb_time_monotonic_ms() >= context->call.deadline_ms)
+		return NB_ERR_TIMEOUT;
+	return NB_OK;
 }
 
-/*
- * Returns NB_OK for both success and ordinary request failures; the latter set
- * *error and leave *result NULL.  Cancellation and an expired host deadline are
- * returned as negative statuses so the runtime can report them as such.
- */
+/* Ordinary request failures become tool error JSON; cancellation and the host
+ * deadline retain their negative status. No host-owned allocation escapes. */
 static int post_json(const char *url, const char *api_key, const char *body,
 		     const struct ext_context *context, char **result,
 		     char **error)
 {
-	CURL *curl;
-	struct curl_slist *headers = NULL;
-	struct curl_slist *tmp;
-	nb_buf response;
-	nb_buf auth;
-	char *auth_header = NULL;
-	struct http_call call = {.context = context, .cancel_status = NB_OK};
-	CURLcode rc;
-	long status = 0;
-	long timeout_ms = DEFAULT_TIMEOUT_MS;
-	long connect_ms = CONNECT_TIMEOUT_MS;
-	int outcome = NB_OK;
+	struct http_resources resources
+		__attribute__((cleanup(http_resources_cleanup))) = {0};
+	nb_http_client_options options;
+	nb_http_request request;
+	nb_err err = {0};
+	int timeout_ms = DEFAULT_TIMEOUT_MS;
+	int rc = request_cancelled(context);
 
 	*result = NULL;
-	nb_buf_init(&response);
-	nb_buf_init(&auth);
-	curl = curl_easy_init();
-	if (!curl) {
-		set_error(error, "curl initialization failed");
-		post_json_cleanup(NULL, NULL, NULL, &auth, &response);
-		return NB_OK;
-	}
+	if (rc != NB_OK)
+		return rc;
 	if (context->call.deadline_ms > 0) {
 		int64_t remaining =
 			context->call.deadline_ms - nb_time_monotonic_ms();
-
-		if (remaining <= 0) {
-			set_error(error, "DeepSeek request deadline expired");
-			post_json_cleanup(curl, headers, auth_header, &auth,
-					  &response);
+		if (remaining <= 0)
 			return NB_ERR_TIMEOUT;
-		}
 		if (remaining < timeout_ms)
-			timeout_ms = (long)remaining;
+			timeout_ms = (int)remaining;
 	}
-	if (connect_ms > timeout_ms)
-		connect_ms = timeout_ms;
-	if (timeout_ms < 1)
-		timeout_ms = 1;
-	if (connect_ms < 1)
-		connect_ms = 1;
-
 	if (strchr(api_key, '\r') || strchr(api_key, '\n')) {
 		set_error(error, "API key contains a line break");
-		post_json_cleanup(curl, headers, auth_header, &auth, &response);
 		return NB_OK;
 	}
-	if (!nb_buf_append_cstr(&auth, "Authorization: ") ||
-	    !nb_buf_append_cstr(&auth, "Bearer ") ||
-	    !nb_buf_append_cstr(&auth, api_key) ||
-	    nb_buf_len(&auth) > 4096) {
+	size_t key_length = strlen(api_key);
+	if (key_length > 4096 - (sizeof("Authorization: Bearer ") - 1)) {
 		set_error(error, "API key is too long");
-		post_json_cleanup(curl, headers, auth_header, &auth, &response);
 		return NB_OK;
 	}
-	auth_header = strdup(nb_buf_cstr(&auth));
-	if (!auth_header) {
-		set_error(error, "out of memory");
-		post_json_cleanup(curl, headers, NULL, &auth, &response);
-		return NB_OK;
-	}
-	tmp = curl_slist_append(headers, "Content-Type: application/json");
-	if (!tmp) {
-		set_error(error, "failed to build HTTP headers");
-		post_json_cleanup(curl, headers, auth_header, &auth, &response);
-		return NB_OK;
-	}
-	headers = tmp;
-	tmp = curl_slist_append(headers, "Accept: application/json");
-	if (!tmp) {
-		set_error(error, "failed to build HTTP headers");
-		post_json_cleanup(curl, headers, auth_header, &auth, &response);
-		return NB_OK;
-	}
-	headers = tmp;
-	tmp = curl_slist_append(headers, auth_header);
-	if (!tmp) {
-		set_error(error, "failed to build HTTP headers");
-		post_json_cleanup(curl, headers, auth_header, &auth, &response);
-		return NB_OK;
-	}
-	headers = tmp;
-	curl_easy_setopt(curl, CURLOPT_URL, url);
-	curl_easy_setopt(curl, CURLOPT_POST, 1L);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_cb);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, connect_ms);
-	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-	curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
-	curl_easy_setopt(curl, CURLOPT_USERAGENT, "morph-deepseek-web/2.0");
-	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, http_progress_cb);
-	curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &call);
-	rc = curl_easy_perform(curl);
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+	resources.auth = malloc(sizeof("Bearer ") + key_length);
+	if (!resources.auth)
+		return NB_ERR_NOMEM;
+	memcpy(resources.auth, "Bearer ", sizeof("Bearer ") - 1);
+	memcpy(resources.auth + sizeof("Bearer ") - 1, api_key, key_length + 1);
+	nb_http_header headers[] = {
+		{NB_STR_LIT("Content-Type"), NB_STR_LIT("application/json")},
+		{NB_STR_LIT("Accept"), NB_STR_LIT("application/json")},
+		{NB_STR_LIT("Authorization"), {resources.auth, strlen(resources.auth)}},
+	};
 
-	if (call.cancel_status != NB_OK) {
-		outcome = call.cancel_status;
-	} else if (rc == CURLE_ABORTED_BY_CALLBACK) {
-		int cancel_status =
-			context->host->check_cancelled(context->host_data);
-
-		outcome = cancel_status != NB_OK ? cancel_status
-						 : NB_ERR_INTERRUPTED;
-	} else if (!nb_buf_ok(&response)) {
-		set_error(error,
-			  "DeepSeek response exceeds the 8 MiB limit");
-	} else if (rc != CURLE_OK) {
-		if (rc == CURLE_OPERATION_TIMEDOUT &&
-		    context->call.deadline_ms > 0 &&
-		    nb_time_monotonic_ms() >= context->call.deadline_ms) {
-			outcome = NB_ERR_TIMEOUT;
-		} else {
-			nb_buf msg;
-
-			nb_buf_init(&msg);
-			nb_buf_printf(&msg, "DeepSeek request failed: %s",
-				      curl_easy_strerror(rc));
-			set_error(error, nb_buf_cstr(&msg));
-			nb_buf_destroy(&msg);
+	nb_http_client_options_init(&options);
+	options.user_agent = "morph-deepseek-web/3.0";
+	rc = nb_http_client_new(&options, &resources.client, &err);
+	if (rc == NB_OK) {
+		nb_http_request_init(&request, "POST", url);
+		request.headers = (nb_http_headers){headers, sizeof(headers) / sizeof(headers[0])};
+		request.body = (nb_str){body, strlen(body)};
+		request.timeouts.connect_ms = timeout_ms < CONNECT_TIMEOUT_MS
+						    ? timeout_ms : CONNECT_TIMEOUT_MS;
+		request.timeouts.response_ms = 0;
+		request.timeouts.idle_ms = 0;
+		request.timeouts.total_ms = timeout_ms;
+		request.redirect = NB_HTTP_REDIRECT_FOLLOW_SAME_ORIGIN;
+		request.max_redirects = 3;
+		request.max_body_bytes = MAX_RESPONSE_BYTES;
+		rc = nb_http_client_send(resources.client, &request, NULL,
+					 &resources.call, &err);
+	}
+	while (rc == NB_OK && !nb_http_call_result(resources.call)) {
+		int cancelled = request_cancelled(context);
+		if (cancelled != NB_OK)
+			return cancelled;
+		int poll_ms = POLL_INTERVAL_MS;
+		if (context->call.deadline_ms > 0) {
+			int64_t remaining =
+				context->call.deadline_ms - nb_time_monotonic_ms();
+			if (remaining <= 0)
+				return NB_ERR_TIMEOUT;
+			if (remaining < poll_ms)
+				poll_ms = (int)remaining;
 		}
-	} else if (status != 200) {
-		nb_buf msg;
+		rc = nb_http_client_poll(resources.client, poll_ms, NULL, &err);
+	}
+	int cancelled = request_cancelled(context);
+	if (cancelled != NB_OK)
+		return cancelled;
 
-		nb_buf_init(&msg);
-		nb_buf_append_cstr(&msg, "DeepSeek API returned HTTP ");
-		nb_buf_append_i64(&msg, (int64_t)status);
-		if (nb_buf_len(&response) > 0) {
-			size_t n = nb_buf_len(&response) > 2000
-					   ? 2000
-					   : nb_buf_len(&response);
-			nb_buf_append_cstr(&msg, ": ");
-			nb_buf_append(&msg, nb_buf_cstr(&response), n);
-		}
-		set_error(error, nb_buf_cstr(&msg));
-		nb_buf_destroy(&msg);
-	} else if (nb_buf_len(&response) == 0) {
+	const nb_http_result *http_result = nb_http_call_result(resources.call);
+	if (rc == NB_OK && http_result) {
+		rc = http_result->status;
+		err = http_result->error;
+	}
+	if (rc == NB_ERR_NOMEM)
+		return rc;
+	if (rc == NB_ERR_TOO_BIG) {
+		set_error(error, "DeepSeek response exceeds the 8 MiB limit");
+		return NB_OK;
+	}
+	if (rc != NB_OK) {
+		set_errorf(error, "DeepSeek request failed: %s",
+			   err.msg[0] ? err.msg : "HTTP transport error");
+		return NB_OK;
+	}
+	if (!http_result || !http_result->response) {
+		set_error(error, "DeepSeek returned no HTTP response");
+		return NB_OK;
+	}
+	nb_str response = {0};
+	rc = nb_http_call_body(resources.call, &response, &err);
+	if (rc != NB_OK)
+		return rc;
+	if (http_result->response->status_code != 200) {
+		int length = response.len > 2000 ? 2000 : (int)response.len;
+		set_errorf(error, "DeepSeek API returned HTTP %d%s%.*s",
+			   http_result->response->status_code, length ? ": " : "",
+			   length, response.ptr ? response.ptr : "");
+	} else if (response.len == 0) {
 		set_error(error, "DeepSeek returned an empty response");
 	} else {
-		*result = strdup(nb_buf_cstr(&response));
+		*result = malloc(response.len + 1);
 		if (!*result)
-			outcome = NB_ERR_NOMEM;
+			return NB_ERR_NOMEM;
+		memcpy(*result, response.ptr, response.len);
+		(*result)[response.len] = '\0';
 	}
-
-	post_json_cleanup(curl, headers, auth_header, &auth, &response);
-	return outcome;
+	return NB_OK;
 }
 
 struct ext_run_resources {
@@ -444,7 +360,7 @@ static int finish_error(struct ext_run_resources *resources,
 	return *result_json ? NB_OK : NB_ERR_NOMEM;
 }
 
-int ext_run_v2(const struct ext_context *context, const char *args_json,
+NB_EXPORT int ext_run_v2(const struct ext_context *context, const char *args_json,
 	       char **result_json)
 {
 	struct ext_run_resources resources = {0};

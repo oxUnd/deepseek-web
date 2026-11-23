@@ -7,7 +7,8 @@ import json
 import os
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HARNESS_ENV = (
     "HARNESS_TEXT_ADAPTER",
@@ -17,6 +18,8 @@ HARNESS_ENV = (
     "HARNESS_VISION_API_KEY",
     "HARNESS_VISION_API_KEY_ENV",
     "HARNESS_HOST_MODE",
+    "HARNESS_CANCEL_AFTER_MS",
+    "HARNESS_DEADLINE_MS",
 )
 CLEARED_ENV = HARNESS_ENV + (
     "DEEPSEEK_API_KEY",
@@ -27,6 +30,8 @@ CLEARED_ENV = HARNESS_ENV + (
 
 class MockHandler(BaseHTTPRequestHandler):
     seen = {}
+    mode = "normal"
+    cross_origin_base = ""
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -37,6 +42,21 @@ class MockHandler(BaseHTTPRequestHandler):
             "content_type": self.headers.get("Content-Type"),
             "body": body.decode("utf-8"),
         }
+        mode = MockHandler.mode
+        if mode == "slow":
+            time.sleep(1)
+        if mode == "redirect" and self.path != "/redirected":
+            self.send_response(307)
+            self.send_header("Location", "/redirected")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if mode == "cross-origin":
+            self.send_response(307)
+            self.send_header("Location", f"{self.cross_origin_base}/other")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         payload = json.dumps(
             {
                 "results": [
@@ -48,11 +68,33 @@ class MockHandler(BaseHTTPRequestHandler):
                 ]
             }
         ).encode()
-        self.send_response(200)
+        if mode == "empty":
+            payload = b""
+        elif mode == "oversized":
+            payload = b"x" * (8 * 1024 * 1024 + 1)
+        elif mode == "http-error":
+            payload = b'{"error":"rate limited"}'
+        self.send_response(429 if mode == "http-error" else 200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # The client may cancel or enforce its response-size limit.
+
+    def log_message(self, *_args):
+        pass
+
+
+class RedirectTarget(BaseHTTPRequestHandler):
+    requests = 0
+
+    def do_POST(self):
+        RedirectTarget.requests += 1
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def log_message(self, *_args):
         pass
@@ -60,8 +102,7 @@ class MockHandler(BaseHTTPRequestHandler):
 
 def load_extension(path):
     lib = ctypes.CDLL(path)
-    lib.harness_run.argtypes = [ctypes.c_char_p,
-                                ctypes.POINTER(ctypes.c_char_p)]
+    lib.harness_run.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
     lib.harness_run.restype = ctypes.c_int
     return lib
 
@@ -121,9 +162,13 @@ def main():
         print(text[:2000])
         return 0 if rc == 0 and '"error"' not in text else 1
 
-    server = HTTPServer(("127.0.0.1", 0), MockHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), MockHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    redirect_target = ThreadingHTTPServer(("127.0.0.1", 0), RedirectTarget)
+    redirect_thread = threading.Thread(target=redirect_target.serve_forever, daemon=True)
+    redirect_thread.start()
+    MockHandler.cross_origin_base = f"http://127.0.0.1:{redirect_target.server_port}"
     base = f"http://127.0.0.1:{server.server_port}"
     args = {
         "action": "search",
@@ -225,7 +270,7 @@ def main():
         },
     )
     print(f"[unsupported adapter] rc={rc} response={text[:160]}")
-    check(rc == 0 and "当前模型不支持" in text,
+    check(rc == 0 and "deepseek_web requires the DeepSeek adapter" in text,
           "unsupported adapter: expected a refusal")
     check(MockHandler.seen == {},
           "unsupported adapter: must not make an HTTP request")
@@ -263,7 +308,68 @@ def main():
     check(rc == 0 and "invalid JSON arguments" in text,
           "invalid json: expected a parse error")
 
+    request_env = {
+        "DEEPSEEK_API_BASE": base,
+        "HARNESS_TEXT_ADAPTER": "deepseek",
+        "HARNESS_TEXT_API_KEY": "inline-key",
+    }
+    for mode, expected in (
+        ("http-error", "HTTP 429: {"),
+        ("empty", "empty response"),
+        ("oversized", "8 MiB limit"),
+        ("cross-origin", "HTTP 307"),
+    ):
+        MockHandler.mode = mode
+        rc, text = call(lib, args, request_env)
+        print(f"[{mode}] rc={rc} response={text[:160]}")
+        check(rc == 0 and expected in json.loads(text).get("error", ""),
+              f"{mode}: expected {expected!r}")
+    check(RedirectTarget.requests == 0, "cross-origin redirect: must not forward the request")
+
+    rc, text = call(lib, args, {**request_env, "DEEPSEEK_API_BASE": "file:///unused"})
+    check(rc == 0 and "DeepSeek request failed" in json.loads(text).get("error", ""),
+          "invalid HTTP URL: expected a transport error")
+    check(MockHandler.seen == {}, "invalid HTTP URL: must not send HTTP")
+    print("[invalid HTTP URL] passed")
+
+    MockHandler.mode = "redirect"
+    rc, text = call(lib, args, request_env)
+    check(rc == 0 and "Mock result" in text and
+          MockHandler.seen.get("path") == "/redirected" and
+          MockHandler.seen.get("authorization") == "Bearer inline-key",
+          "same-origin redirect: expected an authenticated redirected POST")
+    print("[same-origin redirect] passed")
+
+    MockHandler.mode = "normal"
+    for key in ("bad\r\nX-Injected: yes", "x" * 4096):
+        rc, text = call(lib, args, {**request_env, "HARNESS_TEXT_API_KEY": key})
+        check(rc == 0 and "API key" in json.loads(text).get("error", ""),
+              "invalid API key: expected a validation error")
+        check(MockHandler.seen == {}, "invalid API key: must not send HTTP")
+    print("[invalid API keys] passed")
+
+    for field, value, status, mode in (
+        ("HARNESS_CANCEL_AFTER_MS", "0", -14, "normal"),
+        ("HARNESS_DEADLINE_MS", "-1", -7, "normal"),
+        ("HARNESS_CANCEL_AFTER_MS", "120", -14, "slow"),
+        ("HARNESS_DEADLINE_MS", "120", -7, "slow"),
+    ):
+        MockHandler.mode = mode
+        started = time.monotonic()
+        rc, text = call(lib, args, {**request_env, field: value})
+        elapsed = time.monotonic() - started
+        check(rc == status and not text, f"{field}/{mode}: rc={rc}, {text}")
+        check(elapsed < 0.8, f"{field}/{mode}: cancellation took {elapsed:.2f}s")
+        if mode == "normal":
+            check(MockHandler.seen == {}, f"{field}: must not send HTTP")
+        print(f"[{field}/{mode}] rc={rc} elapsed={elapsed:.3f}s")
+
     server.shutdown()
+    server.server_close()
+    thread.join()
+    redirect_target.shutdown()
+    redirect_target.server_close()
+    redirect_thread.join()
     print("all mock checks passed")
     return 0
 
